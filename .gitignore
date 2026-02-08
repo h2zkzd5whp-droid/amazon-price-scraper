@@ -5,3 +5,4 @@ products.db
 .claude/
 output/
 scraper.log
+.env

@@ -18,6 +18,10 @@ import os
 import re
 import random
 import logging
+import urllib.parse
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # 로깅 설정
 logging.basicConfig(
@@ -35,6 +39,7 @@ CONFIG = {
     "output_dir": os.getenv("SCRAPER_OUTPUT_DIR", "output"),
     "db_path": os.getenv("SCRAPER_DB_PATH", "products.db"),
     "max_products": int(os.getenv("SCRAPER_MAX_PRODUCTS", "30")),
+    "max_pages": int(os.getenv("SCRAPER_MAX_PAGES", "3")),
     "timeout": int(os.getenv("SCRAPER_TIMEOUT", "20")),
     "headless": os.getenv("SCRAPER_HEADLESS", "true").lower() == "true",
     "user_agents": [
@@ -42,6 +47,8 @@ CONFIG = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/121.0.0.0 Safari/537.36",
     ],
+    # ScraperAPI 키: https://www.scraperapi.com/ 에서 가입 후 API Key 입력
+    "scraperapi_key": os.getenv("SCRAPERAPI_KEY", ""),
 }
 
 
@@ -75,30 +82,11 @@ def init_db():
         conn.commit()
 
 
-def format_price_usd(price_text: str) -> str:
-    """가격을 USD로 변환. 원화면 환율 적용."""
+def format_price(price_text: str) -> str:
+    """가격 텍스트 정리."""
     if not price_text or price_text == "N/A":
         return "N/A"
-
-    # 통화 감지
-    is_krw = "₩" in price_text or "KRW" in price_text.upper()
-    is_usd = "$" in price_text
-
-    numbers = re.findall(r'[\d,]+\.?\d*', price_text)
-    if not numbers:
-        return "N/A"
-
-    try:
-        price_val = float(numbers[0].replace(',', ''))
-
-        # 원화 → 달러 변환
-        if is_krw or (not is_usd and price_val > 500):  # 500 이상이면 원화로 추정
-            krw_rate = float(os.getenv("KRW_USD_RATE", "1450"))
-            price_val = price_val / krw_rate
-
-        return f"${price_val:.2f} USD"
-    except ValueError:
-        return "N/A"
+    return price_text.strip()
 
 
 class AmazonScraper:
@@ -108,6 +96,14 @@ class AmazonScraper:
         self.keyword = keyword
         self.driver = None
         self.scraped_data = []
+        self._use_scraperapi = bool(CONFIG["scraperapi_key"])
+
+    def _build_url(self, amazon_url: str) -> str:
+        """ScraperAPI 사용 시 API URL로 변환, 아니면 원본 반환."""
+        if not self._use_scraperapi:
+            return amazon_url
+        encoded = urllib.parse.quote(amazon_url, safe="")
+        return f"http://api.scraperapi.com?api_key={CONFIG['scraperapi_key']}&url={encoded}"
 
     def _create_driver(self) -> webdriver.Chrome:
         """Chrome 드라이버 생성."""
@@ -146,7 +142,10 @@ class AmazonScraper:
     def _is_blocked(self) -> bool:
         """차단 페이지 확인."""
         page_source = self.driver.page_source.lower()
-        return any(x in page_source for x in ["sorry, something went wrong", "captcha", "robot"])
+        blocked_signs = ["sorry, something went wrong", "captcha", "api-services-support@amazon.com"]
+        has_block_sign = any(x in page_source for x in blocked_signs)
+        has_no_results = "s-search-result" not in page_source and "s-result-item" not in page_source
+        return has_block_sign or (has_no_results and "robot" in page_source)
 
     def _extract_product_data(self, product) -> dict | None:
         """단일 제품 데이터 추출."""
@@ -164,7 +163,7 @@ class AmazonScraper:
 
         # 가격
         raw_price = safe_extract("span.a-offscreen", "innerHTML")
-        price = format_price_usd(raw_price)
+        price = format_price(raw_price)
 
         # 평점
         rating = safe_extract("span.a-icon-alt", "innerHTML")
@@ -197,6 +196,8 @@ class AmazonScraper:
             "a.a-link-normal.s-no-outline",
             "a.a-link-normal[href*='/dp/']",
             ".s-product-image-container a",
+            "a[data-asin]",  # ASIN 기반 링크
+            "div[data-asin] a[href*='/dp/']",
         ]
         for selector in url_selectors:
             try:
@@ -225,41 +226,78 @@ class AmazonScraper:
             "keyword": self.keyword,
         }
 
-    def scrape(self) -> list[dict]:
-        """스크래핑 실행."""
+    def _scrape_page(self, page_num: int) -> list[dict]:
+        """현재 페이지에서 제품 데이터 추출."""
+        page_data = []
+        remaining = CONFIG["max_products"] - len(self.scraped_data)
+        if remaining <= 0:
+            return page_data
+
         try:
-            self.driver = self._create_driver()
-            url = f"https://www.amazon.com/s?k={self.keyword.replace(' ', '+')}"
-
-            logger.info("Connecting to Amazon...")
-            self.driver.get("https://www.amazon.com")
-            self._random_delay(2, 3)
-
-            self.driver.get(url)
-            self._random_delay(2, 3)
-            self._human_scroll()
-
             wait = WebDriverWait(self.driver, CONFIG["timeout"])
             wait.until(EC.presence_of_all_elements_located(
                 (By.CSS_SELECTOR, "[data-component-type='s-search-result']")
             ))
-            products = self.driver.find_elements(
-                By.CSS_SELECTOR, "[data-component-type='s-search-result']"
-            )
+        except TimeoutException:
+            logger.info(f"Page {page_num}: No results (last page). Stopping.")
+            return page_data
 
-            if not products:
-                logger.warning("No products found.")
-                return []
+        products = self.driver.find_elements(
+            By.CSS_SELECTOR, "[data-component-type='s-search-result']"
+        )
+
+        if not products:
+            logger.warning(f"Page {page_num}: No products found.")
+            return page_data
+
+        logger.info(f"Page {page_num}: {len(products)} products found")
+
+        for product in products[:remaining]:
+            data = self._extract_product_data(product)
+            if data:
+                page_data.append(data)
+                logger.info(f"{data['title'][:50]}... | {data['price']}")
+
+        return page_data
+
+    def scrape(self) -> list[dict]:
+        """스크래핑 실행 (페이지네이션 + ScraperAPI)."""
+        try:
+            self.driver = self._create_driver()
+            amazon_base = f"https://www.amazon.com/s?k={self.keyword.replace(' ', '+')}"
+
+            if self._use_scraperapi:
+                logger.info("Using ScraperAPI")
+            else:
+                logger.info("Connecting to Amazon (direct)...")
+                self.driver.get("https://www.amazon.com")
+                self._random_delay(2, 3)
 
             logger.info(f"Search keyword: {self.keyword}")
-            logger.info(f"Products found: {len(products)}")
 
-            for product in products[:CONFIG["max_products"]]:
-                data = self._extract_product_data(product)
-                if data:
-                    self.scraped_data.append(data)
-                    logger.info(f"{data['title'][:50]}... | {data['price']}")
+            for page in range(1, CONFIG["max_pages"] + 1):
+                if len(self.scraped_data) >= CONFIG["max_products"]:
+                    logger.info("Max products reached.")
+                    break
 
+                # 페이지 URL 구성
+                page_url = amazon_base if page == 1 else f"{amazon_base}&page={page}"
+                self.driver.get(self._build_url(page_url))
+                self._random_delay(2, 4)
+                self._human_scroll()
+
+                if self._is_blocked():
+                    logger.error(f"Page {page}: Blocked! Stopping.")
+                    break
+
+                page_data = self._scrape_page(page)
+                self.scraped_data.extend(page_data)
+
+                if not page_data:
+                    logger.info("No more products. Stopping.")
+                    break
+
+            logger.info(f"Total products scraped: {len(self.scraped_data)}")
             return self.scraped_data
 
         except TimeoutException:
@@ -267,11 +305,11 @@ class AmazonScraper:
                 logger.error("Amazon blocked the request.")
             else:
                 logger.error("Page load timeout.")
-            return []
+            return self.scraped_data
 
         except WebDriverException as e:
             logger.error(f"WebDriver error: {e}")
-            return []
+            return self.scraped_data
 
         finally:
             if self.driver:
